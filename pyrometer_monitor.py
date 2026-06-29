@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 """
 AST Pyrometer Monitor — MT500_AST Protocol
-Polls 4 pyrometers over RS485 and prints all readings.
-
-Hardware setup  : All sensors share one RS485 bus (half-duplex).
-Serial settings : 19200 baud, 8 data bits, 1 stop bit, no parity.
-Protocol        : MT500_AST — only RD (Batch Read) commands are used.
-
-Usage:
-    pip install pyserial
-    python pyrometer_monitor.py
+Polls pyrometers over RS485 and prints all readings.
 """
 
 import serial
@@ -22,7 +14,7 @@ SERIAL_PORT   = "COM3"          # Windows: "COM3" | Linux/macOS: "/dev/ttyUSB0"
 BAUD_RATE     = 19200
 TIMEOUT       = 0.5             # Serial read timeout (seconds)
 POLL_INTERVAL = 2.0             # Seconds between full scan cycles
-STATION_IDS   = [1, 2, 3, 4]   # Station IDs of your 4 pyrometers
+STATION_IDS   = [1, 2, 3, 4]    # MUST match the IDs used in the working software!
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Appendix A — status codes
@@ -78,30 +70,53 @@ DIM    = lambda t: _c("2",  t)
 # ─── MT500 PROTOCOL HELPERS ──────────────────────────────────────────────────
 
 def _build_rd(station_id: int, address: int, num_items: int) -> bytes:
-    """
-    Build a Batch Read (RD) command packet.
-
-    Frame layout (all ASCII except STX/ETX):
-      [STX] [StationID 2-hex] [RD] [Address 4-hex] [Items 2-hex] [ETX] [Checksum 2-hex]
-
-    Checksum = lowest byte of sum(bytes 2..L-2, 1-indexed) — i.e. everything
-    between STX and the checksum itself, including ETX.
-    """
+    """ Build a Batch Read (RD) command packet. """
     payload = f"{station_id:02X}RD{address:04X}{num_items:02X}"
     etx     = bytes([0x03])
     chksum  = sum(payload.encode("ascii") + etx) & 0xFF
     return bytes([0x02]) + payload.encode("ascii") + etx + f"{chksum:02X}".encode("ascii")
 
 
-def _verify_reply_checksum(data: bytes, expected_len: int) -> bool:
+def _verify_reply_checksum(data: bytes) -> bool:
     """Verify the checksum embedded in an RD reply."""
+    if len(data) < 4:
+        return False
     try:
-        # Checksum covers bytes 2..L-2 (1-indexed) = indices 1..(L-3) (0-indexed)
-        computed = sum(data[1 : expected_len - 2]) & 0xFF
-        received = int(data[expected_len - 2 : expected_len].decode("ascii"), 16)
+        # Checksum covers from byte 1 up to ETX
+        computed = sum(data[1:-2]) & 0xFF
+        received = int(data[-2:].decode("ascii"), 16)
         return computed == received
     except Exception:
         return False
+
+
+def _read_frame(ser: serial.Serial) -> bytes:
+    """Smart read: reads exactly one complete MT500 frame to avoid timeouts."""
+    buf = bytearray()
+    
+    # 1. Wait for start byte (0x02 STX or 0x15 NAK)
+    while True:
+        b = ser.read(1)
+        if not b:  # Timeout
+            return bytes()
+        if b in (b'\x02', b'\x15'):
+            buf.extend(b)
+            break
+            
+    # 2. Read until ETX (0x03)
+    while True:
+        b = ser.read(1)
+        if not b: # Timeout
+            return bytes(buf)
+        buf.extend(b)
+        if b == b'\x03':
+            break
+            
+    # 3. Read exactly 2 bytes for the checksum
+    chksum = ser.read(2)
+    buf.extend(chksum)
+    
+    return bytes(buf)
 
 
 def read_registers(
@@ -110,27 +125,20 @@ def read_registers(
     address: int,
     num_items: int,
 ) -> tuple:
-    """
-    Send an RD command and return (list_of_int_values, None) on success
-    or (None, error_string) on failure.
-
-    Reply length formula from spec: L = (N × 4) + 8
-    Data words (4 ASCII hex chars each) start at byte index 5 (0-indexed).
-    """
-    expected_len = (num_items * 4) + 8
-
+    """Send an RD command and return values or an error message."""
     cmd = _build_rd(station_id, address, num_items)
+    
     ser.reset_input_buffer()
     ser.write(cmd)
+    ser.flush()  # CRITICAL: Force OS to send immediately so we don't miss the 5ms window
 
-    # Spec mandates a 5 ms slave delay; we wait a bit longer to be safe
-    time.sleep(0.05)
-    response = ser.read(expected_len + 4)  # small extra buffer
+    # Read exactly one complete response frame
+    response = _read_frame(ser)
 
     if not response:
-        return None, "No response (timeout — check wiring / station ID)"
+        return None, "No response (timeout)"
 
-    # NAK reply: [NAK=0x15][Station 2][Cmd 2][ErrorCode 1]
+    # NAK reply check: [NAK=0x15][Station 2][Cmd 2][ErrorCode 1]
     if response[0] == 0x15:
         code = chr(response[5]) if len(response) >= 6 else "?"
         desc = NAK_ERROR_CODES.get(code, "Unknown error")
@@ -139,11 +147,13 @@ def read_registers(
     if response[0] != 0x02:
         return None, f"Unexpected start byte: {response[0]:#04x}"
 
-    if len(response) < expected_len:
-        return None, f"Short reply: got {len(response)}, need {expected_len} bytes"
-
-    if not _verify_reply_checksum(response, expected_len):
+    if not _verify_reply_checksum(response):
         return None, "Checksum mismatch in reply"
+
+    # Expected Length = L = (N * 4) + 8. Check if we received enough data.
+    expected_len = (num_items * 4) + 8
+    if len(response) < expected_len:
+        return None, f"Short reply: got {len(response)}, expected {expected_len}"
 
     # Parse N data words (each is 4 ASCII hex chars) starting at index 5
     values = []
@@ -160,10 +170,6 @@ def read_registers(
 # ─── HIGH-LEVEL PYROMETER READS ──────────────────────────────────────────────
 
 def read_pyrometer(ser: serial.Serial, station_id: int) -> dict:
-    """
-    Read all useful registers from one pyrometer.
-    Returns a dict — failed reads are stored as None with an error note.
-    """
     r: dict = {"station": station_id, "errors": []}
 
     def _get(address, n, label):
@@ -172,9 +178,7 @@ def read_pyrometer(ser: serial.Serial, station_id: int) -> dict:
             r["errors"].append(f"[0x{address:04X}] {label}: {err}")
         return vals
 
-    # ── Object temperature (°K) + status code ─────────────────────────────
-    #    Address 0x0000 → temperature in °K
-    #    Address 0x0001 → status code  (Appendix A)
+    # Object temperature (°K) + status code
     vals = _get(0x0000, 2, "Temp + Status")
     if vals:
         temp_k = vals[0]
@@ -190,19 +194,19 @@ def read_pyrometer(ser: serial.Serial, station_id: int) -> dict:
         for k in ("temp_k", "temp_c", "temp_f", "status_code", "status_label", "status_desc"):
             r[k] = None
 
-    # ── Relative energy (2-colour sensors; stored × 1000) ─────────────────
+    # Relative energy 
     vals = _get(0x0002, 1, "Rel. energy")
     r["relative_energy"] = round(vals[0] / 1000, 3) if vals else None
 
-    # ── Internal case temp (°C) + optical head temp (m°C) ─────────────────
+    # Internal case temp (°C) + optical head temp (m°C)
     vals = _get(0x0006, 2, "Int/Head temp")
     if vals:
         r["internal_temp_c"] = vals[0]
-        r["head_temp_c"]     = round(vals[1] / 1000, 3)   # m°C → °C
+        r["head_temp_c"]     = round(vals[1] / 1000, 3) 
     else:
         r["internal_temp_c"] = r["head_temp_c"] = None
 
-    # ── Emissivity + slope (stored × 1000) ────────────────────────────────
+    # Emissivity + slope
     vals = _get(0x0400, 2, "Emissivity")
     if vals:
         r["emissivity"]       = round(vals[0] / 1000, 3)
@@ -210,22 +214,14 @@ def read_pyrometer(ser: serial.Serial, station_id: int) -> dict:
     else:
         r["emissivity"] = r["emissivity_slope"] = None
 
-    # ── Response time τ ───────────────────────────────────────────────────
+    # Response time 
     vals = _get(0x0105, 1, "Response time")
     if vals:
         r["response_time"] = RESPONSE_TIME_MAP.get(vals[0], f"τ={vals[0]}")
     else:
         r["response_time"] = None
 
-    # ── Clear time setting ────────────────────────────────────────────────
-    vals = _get(0x0303, 1, "Clear time")
-    if vals:
-        ct = vals[0]
-        r["clear_time"] = "OFF" if ct == 0 else "Auto" if ct == 1 else f"{10 * ct} ms"
-    else:
-        r["clear_time"] = None
-
-    # ── Laser on/off ──────────────────────────────────────────────────────
+    # Laser on/off
     vals = _get(0x0F00, 1, "Laser")
     if vals:
         r["laser"] = "ON" if vals[0] == 1 else "OFF"
@@ -243,11 +239,8 @@ def _row(label: str, value: str) -> str:
     label_col = f"{label:<18}"
     return f"  │  {label_col}: {value}"
 
-
 def print_pyrometer_block(d: dict) -> None:
     sid = d["station"]
-
-    # Colour the status badge
     lbl = d.get("status_label") or "?"
     if lbl == "OK":
         badge = GREEN(f"[{lbl}]")
@@ -259,45 +252,29 @@ def print_pyrometer_block(d: dict) -> None:
     header = BOLD(f" Pyrometer  #  {sid} ")
     print(f"  ┌{'─' * 5}{header}{'─' * (_W - 5 - len(f' Pyrometer  #  {sid} '))}┐")
 
-    # Temperature
-    tc = d.get("temp_c")
-    tf = d.get("temp_f")
-    tk = d.get("temp_k")
+    tc, tf, tk = d.get("temp_c"), d.get("temp_f"), d.get("temp_k")
     if tc is not None:
         temp_str = f"{tc:>9.2f} °C  /  {tf:>9.2f} °F  /  {tk} K"
     else:
         temp_str = RED("N/A")
     print(_row("Temperature", temp_str))
 
-    # Status
-    status_str = f"{badge}  {d.get('status_desc', 'N/A')}"
-    print(_row("Status", status_str))
+    print(_row("Status", f"{badge}  {d.get('status_desc', 'N/A')}"))
 
-    # Internal / head temperature
-    it = d.get("internal_temp_c")
-    ht = d.get("head_temp_c")
-    it_str = f"{it} °C" if it is not None else DIM("N/A")
-    ht_str = f"{ht} °C" if ht is not None else DIM("N/A")
-    print(_row("Internal Temp", it_str))
-    print(_row("Head Temp", ht_str))
+    it, ht = d.get("internal_temp_c"), d.get("head_temp_c")
+    print(_row("Internal Temp", f"{it} °C" if it is not None else DIM("N/A")))
+    print(_row("Head Temp", f"{ht} °C" if ht is not None else DIM("N/A")))
 
-    # Emissivity
-    em = d.get("emissivity")
-    es = d.get("emissivity_slope")
+    em, es = d.get("emissivity"), d.get("emissivity_slope")
     em_str = f"{em}" if em is not None else DIM("N/A")
     es_str = f"slope {es}" if es is not None else DIM("N/A")
     print(_row("Emissivity", f"{em_str}   {es_str}"))
 
-    # Relative energy
     re = d.get("relative_energy")
     print(_row("Relative Energy", f"{re}" if re is not None else DIM("N/A (single-colour)")))
-
-    # Misc
     print(_row("Response Time τ", d.get("response_time") or DIM("N/A")))
-    print(_row("Clear Time",      d.get("clear_time")    or DIM("N/A")))
     print(_row("Laser",           d.get("laser")         or DIM("N/A")))
 
-    # Errors
     if d["errors"]:
         print(f"  │")
         for err in d["errors"]:
@@ -347,7 +324,6 @@ def main() -> None:
         )
     except serial.SerialException as exc:
         print(RED(f"\nCould not open {SERIAL_PORT}: {exc}"))
-        print("Check SERIAL_PORT at the top of the script.")
         sys.exit(1)
 
     print(f"Opened {SERIAL_PORT}  ✓   Polling every {POLL_INTERVAL}s   (Ctrl+C to stop)\n")
@@ -371,7 +347,6 @@ def main() -> None:
     finally:
         if ser.is_open:
             ser.close()
-
 
 if __name__ == "__main__":
     main()
